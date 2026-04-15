@@ -4,6 +4,7 @@ AWS Identity Center Manager
 
 A CLI tool for managing AWS Identity Center users:
   - create-users          : Bulk create users from a CSV file
+  - delete-users          : Bulk delete users from the Identity Store
   - reset-password        : Send password reset emails to users
   - enrich                : Enrich a Kiro subscription list with Identity Center user details
   - export-subscriptions  : Export Kiro subscriptions with enriched user details
@@ -13,6 +14,7 @@ A CLI tool for managing AWS Identity Center users:
 Usage:
   python idc_manager.py create-users users.csv
   python idc_manager.py create-users users.csv --reset-password
+  python idc_manager.py delete-users --csv users.csv
   python idc_manager.py reset-password --csv users.csv
   python idc_manager.py enrich kiro-subscriptions.csv -o users.csv
   python idc_manager.py export-subscriptions -o users.csv
@@ -1229,6 +1231,100 @@ def cmd_import_store(args: argparse.Namespace) -> None:
 
     logging.info("Done.")
 
+# ---------------------------------------------------------------------------
+# Subcommand: delete-users
+# ---------------------------------------------------------------------------
+
+def cmd_delete_users(args: argparse.Namespace) -> None:
+    """Bulk delete users from the Identity Store."""
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+
+    if args.identity_store_id:
+        id_store = args.identity_store_id
+    else:
+        id_store, _ = get_identity_store_id(session, args.region)
+    logging.info("Using Identity Store: %s", id_store)
+
+    # Build username list from CSV or report
+    usernames: list[str] = []
+    if args.csv:
+        csv_users = parse_csv_simple(args.csv)
+        usernames = [u["username"] for u in csv_users]
+    elif args.report:
+        report_users = load_report(args.report)
+        usernames = [u["username"] for u in report_users]
+
+    if not usernames:
+        logging.error("No users to delete")
+        sys.exit(1)
+
+    # Resolve usernames -> user_ids
+    logging.info("Resolving %d username(s) to UserIds...", len(usernames))
+    all_users = list_all_users(session, id_store, args.region)
+    user_map: dict[str, str] = {}  # {username: user_id}
+    not_found: list[str] = []
+    for uname in usernames:
+        uid = all_users.get(uname)
+        if uid:
+            user_map[uname] = uid
+        else:
+            not_found.append(uname)
+            logging.warning("User '%s' not found in Identity Center, skipping", uname)
+
+    if not user_map:
+        logging.error("No users found to delete")
+        sys.exit(1)
+
+    logging.info("Found %d user(s) to delete", len(user_map))
+
+    if args.dry_run:
+        logging.info("[DRY RUN] Would delete the following users:")
+        for uname in user_map:
+            logging.info("  %s", uname)
+        return
+
+    client = session.client("identitystore", region_name=args.region)
+    deleted: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    def _delete(username: str, user_id: str) -> tuple[str, bool, str]:
+        try:
+            client.delete_user(IdentityStoreId=id_store, UserId=user_id)
+            return username, True, ""
+        except ClientError as exc:
+            return username, False, str(exc)
+
+    with ThreadPoolExecutor(max_workers=min(args.workers, len(user_map))) as pool:
+        futures = {
+            pool.submit(_delete, uname, uid): uname
+            for uname, uid in user_map.items()
+        }
+        for fut in as_completed(futures):
+            username, ok, err = fut.result()
+            if ok:
+                logging.info("Deleted: %s", username)
+                deleted.append(username)
+            else:
+                logging.error("Failed to delete %s: %s", username, err)
+                failed.append((username, err))
+
+    print("\n" + "=" * 60)
+    print("DELETE USERS SUMMARY")
+    print("=" * 60)
+    print(f"  Deleted   : {len(deleted)}")
+    print(f"  Not found : {len(not_found)}")
+    print(f"  Failed    : {len(failed)}")
+    print("=" * 60)
+
+    if failed:
+        print("\nFailed users:")
+        for uname, err in failed:
+            print(f"  - {uname}: {err}")
+        sys.exit(1)
+
+    logging.info("Done.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="idc_manager",
@@ -1394,6 +1490,33 @@ Examples:
     p_import.add_argument("--dry-run", "-n", action="store_true", help="Show what would be imported without making changes")
     p_import.add_argument("--force", action="store_true", help="Allow importing into the same Identity Store as source")
     p_import.set_defaults(func=cmd_import_store)
+
+    # -- delete-users -------------------------------------------------------
+    p_delete = subparsers.add_parser(
+        "delete-users",
+        help="Bulk delete users from the Identity Store",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Delete users from AWS Identity Center by username. Accepts a CSV file
+or a JSON report from create-users.
+
+This operation is IRREVERSIBLE. Use --dry-run to preview first.
+
+Examples:
+  idc_manager.py delete-users --csv users.csv --dry-run
+  idc_manager.py delete-users --csv users.csv
+  idc_manager.py delete-users --report report.json -r us-east-1
+""",
+    )
+    delete_input = p_delete.add_mutually_exclusive_group(required=True)
+    delete_input.add_argument("--csv", type=Path, help="CSV file with users to delete")
+    delete_input.add_argument("--report", type=Path, help="JSON report from create-users")
+    p_delete.add_argument("--identity-store-id", "-i", help="Identity Store ID (auto-detected if omitted)")
+    p_delete.add_argument("--region", "-r", default="us-east-1", help="AWS region (default: us-east-1)")
+    p_delete.add_argument("--profile", "-p", help="AWS CLI named profile")
+    p_delete.add_argument("--dry-run", "-n", action="store_true", help="Preview which users would be deleted")
+    p_delete.add_argument("--workers", "-w", type=int, default=5, help="Parallel workers (default: 5)")
+    p_delete.set_defaults(func=cmd_delete_users)
 
     args = parser.parse_args()
 

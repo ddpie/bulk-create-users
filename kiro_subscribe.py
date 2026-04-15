@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Bulk Subscribe Users to Kiro Tiers
+Bulk Subscribe / Unsubscribe Users to Kiro Tiers
 
-Calls the AmazonQDeveloperService.CreateAssignment API to subscribe
-AWS Identity Center users to Kiro plans (Pro, Pro+, Power).
+Calls the AmazonQDeveloperService.CreateAssignment / DeleteAssignment API to
+subscribe or unsubscribe AWS Identity Center users to Kiro plans (Pro, Pro+, Power).
 
 Usage:
   python kiro_subscribe.py --csv users.csv --region us-east-1
   python kiro_subscribe.py --report report.json --tier pro --region us-east-1
+  python kiro_subscribe.py --unsubscribe --csv users.csv --region us-east-1
 """
 
 import argparse
@@ -126,6 +127,59 @@ def create_assignment(
     return False, "Max retries exceeded"
 
 
+def delete_assignment(
+    principal_id: str,
+    credentials,
+    region: str,
+    principal_type: str = "USER",
+    max_retries: int = 5,
+) -> tuple[bool, str]:
+    """
+    Call AmazonQDeveloperService.DeleteAssignment to unsubscribe a user or group.
+
+    Retries with exponential backoff on ThrottlingException (HTTP 429).
+    Returns (success, error_message).
+    """
+    url = f"https://codewhisperer.{region}.amazonaws.com/"
+    body = json.dumps({
+        "principalId": principal_id,
+        "principalType": principal_type,
+    })
+    headers = {
+        "Content-Type": "application/x-amz-json-1.0",
+        "X-Amz-Target": "AmazonQDeveloperService.DeleteAssignment",
+    }
+
+    for attempt in range(max_retries + 1):
+        request = botocore.awsrequest.AWSRequest(
+            method="POST", url=url, data=body, headers=headers,
+        )
+        signer = botocore.auth.SigV4Auth(credentials, "q", region)
+        signer.add_auth(request)
+
+        req = urllib.request.Request(
+            url, data=body.encode(), headers=dict(request.headers), method="POST",
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=30)
+            resp.read()
+            return True, ""
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode()
+            if exc.code == 429 and attempt < max_retries:
+                delay = min(30 * 2 ** attempt, 300)
+                logging.warning(
+                    "Throttled (attempt %d/%d), retrying in %ds...",
+                    attempt + 1, max_retries, delay,
+                )
+                time.sleep(delay)
+                continue
+            return False, f"HTTP {exc.code}: {error_body}"
+        except Exception as exc:
+            return False, str(exc)
+    return False, "Max retries exceeded"
+
+
 def get_identity_store_id(session: boto3.Session, region: str | None = None) -> str:
     sso_admin = session.client("sso-admin", region_name=region)
     resp = sso_admin.list_instances()
@@ -205,7 +259,7 @@ def main() -> None:
     tier_help = "Kiro tier: pro ($20/mo), pro+ ($40/mo), power ($200/mo)"
 
     parser = argparse.ArgumentParser(
-        description="Bulk subscribe AWS Identity Center users to Kiro tiers.",
+        description="Bulk subscribe/unsubscribe AWS Identity Center users to Kiro tiers.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""\
 Tier names (case-insensitive):
@@ -218,6 +272,8 @@ Examples:
   %(prog)s --csv users.csv --tier pro --region us-east-1
   %(prog)s --report report.json --tier power --region us-east-1
   %(prog)s --report report.json --tier pro+ --workers 10
+  %(prog)s --unsubscribe --csv users.csv --region us-east-1
+  %(prog)s --unsubscribe --report report.json --region us-east-1
 """,
     )
 
@@ -226,6 +282,7 @@ Examples:
     input_group.add_argument("--report", type=Path, help="JSON report from idc_manager.py create-users")
 
     parser.add_argument("--tier", "-t", help=f"{tier_help}. Required with --report, optional default with --csv")
+    parser.add_argument("--unsubscribe", action="store_true", help="Unsubscribe users instead of subscribing (ignores --tier)")
     parser.add_argument("--region", "-r", default="us-east-1", help="AWS region (default: us-east-1)")
     parser.add_argument("--profile", "-p", help="AWS CLI named profile")
     parser.add_argument("--workers", "-w", type=int, default=5, help="Number of parallel workers (default: 5)")
@@ -239,6 +296,91 @@ Examples:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    if args.report and not args.tier and not args.unsubscribe:
+        parser.error("--tier is required when using --report (unless --unsubscribe)")
+
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    credentials = session.get_credentials().get_frozen_credentials()
+
+    # ---- unsubscribe mode -------------------------------------------------
+    if args.unsubscribe:
+        # Collect usernames from CSV or report
+        usernames: list[str] = []
+        if args.report:
+            if not args.report.exists():
+                logging.error("Report file not found: %s", args.report)
+                sys.exit(1)
+            data = json.loads(args.report.read_text())
+            usernames = [u["username"] for u in data.get("created", [])]
+        else:
+            if not args.csv.exists():
+                logging.error("CSV file not found: %s", args.csv)
+                sys.exit(1)
+            with open(args.csv, newline="", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    norm = {k.strip().lower().replace(" ", "_"): v.strip() for k, v in row.items()}
+                    uname = norm.get("username") or norm.get("user_name") or norm.get("email") or ""
+                    if uname:
+                        usernames.append(uname)
+
+        if not usernames:
+            logging.error("No users found to unsubscribe")
+            sys.exit(1)
+
+        # Resolve usernames -> user_ids
+        logging.info("Resolving %d username(s) to UserIds...", len(usernames))
+        id_store = get_identity_store_id(session, args.region)
+        all_users = list_all_users(session, id_store, args.region)
+        user_map: dict[str, str] = {}
+        for uname in usernames:
+            uid = all_users.get(uname)
+            if uid:
+                user_map[uname] = uid
+            else:
+                logging.warning("User '%s' not found in Identity Center, skipping", uname)
+
+        if not user_map:
+            logging.error("No users found to unsubscribe after resolving UserIds")
+            sys.exit(1)
+
+        logging.info("Will unsubscribe %d user(s) with %d worker(s)", len(user_map), min(args.workers, len(user_map)))
+
+        succeeded: list[str] = []
+        failed: list[tuple[str, str]] = []
+
+        def _unsub(username: str, user_id: str) -> tuple[str, bool, str]:
+            ok, err = delete_assignment(user_id, credentials, args.region)
+            return username, ok, err
+
+        with ThreadPoolExecutor(max_workers=min(args.workers, len(user_map))) as pool:
+            futures = {pool.submit(_unsub, uname, uid): uname for uname, uid in user_map.items()}
+            for fut in as_completed(futures):
+                username, ok, err = fut.result()
+                if ok:
+                    logging.info("Unsubscribed: %s", username)
+                    succeeded.append(username)
+                else:
+                    logging.error("Failed for %s: %s", username, err)
+                    failed.append((username, err))
+
+        print("\n" + "=" * 60)
+        print("KIRO UNSUBSCRIBE SUMMARY")
+        print("=" * 60)
+        print(f"  Unsubscribed : {len(succeeded)}")
+        print(f"  Failed       : {len(failed)}")
+        print("=" * 60)
+
+        if failed:
+            print("\nFailed users:")
+            for uname, err in failed:
+                print(f"  - {uname}: {err}")
+            sys.exit(1)
+
+        logging.info("Done.")
+        return
+
+    # ---- subscribe mode (original) ----------------------------------------
     if args.report and not args.tier:
         parser.error("--tier is required when using --report")
 

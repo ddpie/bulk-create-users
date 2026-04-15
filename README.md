@@ -39,12 +39,13 @@ pip install -r requirements.txt
 | Script | Description |
 |--------|-------------|
 | `idc_manager.py create-users` | Bulk create users from a CSV file |
+| `idc_manager.py delete-users` | Bulk delete users from the Identity Store |
 | `idc_manager.py reset-password` | Send password reset emails |
 | `idc_manager.py enrich` | Enrich a Kiro subscription export with user details |
 | `idc_manager.py export-subscriptions` | Export Kiro subscriptions with enriched user details |
 | `idc_manager.py export-store` | Export all users, groups, memberships from an Identity Store |
 | `idc_manager.py import-store` | Import users, groups, memberships into another Identity Store |
-| `kiro_subscribe.py` | Subscribe users to Kiro tiers (Pro, Pro+, Power) |
+| `kiro_subscribe.py` | Subscribe/unsubscribe users to Kiro tiers (Pro, Pro+, Power) |
 | `kiro_migrate.py` | **One-command migration** -- automates all 5 steps |
 
 ---
@@ -115,6 +116,17 @@ python idc_manager.py create-users users.csv \
 
 # 2. Subscribe to Kiro
 python kiro_subscribe.py --csv users.csv --region us-east-1
+```
+
+### Cleanup: Unsubscribe + Delete Users
+
+```bash
+# Unsubscribe from Kiro
+python kiro_subscribe.py --unsubscribe --csv users.csv --region us-east-1
+
+# Delete users (preview first)
+python idc_manager.py delete-users --csv users.csv --dry-run
+python idc_manager.py delete-users --csv users.csv --region us-east-1
 ```
 
 ---
@@ -290,6 +302,7 @@ Run `--help` on any command for full details:
 ```bash
 python idc_manager.py --help
 python idc_manager.py create-users --help
+python idc_manager.py delete-users --help
 python idc_manager.py reset-password --help
 python idc_manager.py enrich --help
 python idc_manager.py export-subscriptions --help
