@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Bulk Subscribe / Unsubscribe Users to Kiro Tiers
+Bulk Subscribe / Unsubscribe / Change Tier for Kiro Users
 
-Calls the AmazonQDeveloperService.CreateAssignment / DeleteAssignment API to
-subscribe or unsubscribe AWS Identity Center users to Kiro plans (Pro, Pro+, Power).
+Calls the AmazonQDeveloperService CreateAssignment / UpdateAssignment / DeleteAssignment
+API to manage AWS Identity Center users' Kiro plans (Pro, Pro+, Power).
 
 Usage:
   python kiro_subscribe.py --csv users.csv --region us-east-1
   python kiro_subscribe.py --report report.json --tier pro --region us-east-1
+  python kiro_subscribe.py --change-tier --tier power --csv users.csv
   python kiro_subscribe.py --unsubscribe --csv users.csv --region us-east-1
 """
 
@@ -95,6 +96,61 @@ def create_assignment(
     headers = {
         "Content-Type": "application/x-amz-json-1.0",
         "X-Amz-Target": "AmazonQDeveloperService.CreateAssignment",
+    }
+
+    for attempt in range(max_retries + 1):
+        request = botocore.awsrequest.AWSRequest(
+            method="POST", url=url, data=body, headers=headers,
+        )
+        signer = botocore.auth.SigV4Auth(credentials, "q", region)
+        signer.add_auth(request)
+
+        req = urllib.request.Request(
+            url, data=body.encode(), headers=dict(request.headers), method="POST",
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=30)
+            resp.read()
+            return True, ""
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode()
+            if exc.code == 429 and attempt < max_retries:
+                delay = min(30 * 2 ** attempt, 300)
+                logging.warning(
+                    "Throttled (attempt %d/%d), retrying in %ds...",
+                    attempt + 1, max_retries, delay,
+                )
+                time.sleep(delay)
+                continue
+            return False, f"HTTP {exc.code}: {error_body}"
+        except Exception as exc:
+            return False, str(exc)
+    return False, "Max retries exceeded"
+
+
+def update_assignment(
+    principal_id: str,
+    subscription_type: str,
+    credentials,
+    region: str,
+    principal_type: str = "USER",
+    max_retries: int = 5,
+) -> tuple[bool, str]:
+    """
+    Call AmazonQDeveloperService.UpdateAssignment to change a user's Kiro tier.
+
+    Retries with exponential backoff on ThrottlingException (HTTP 429).
+    Returns (success, error_message).
+    """
+    url = f"https://codewhisperer.{region}.amazonaws.com/"
+    body = json.dumps({
+        "principalId": principal_id,
+        "principalType": principal_type,
+        "subscriptionType": subscription_type,
+    })
+    headers = {
+        "Content-Type": "application/x-amz-json-1.0",
+        "X-Amz-Target": "AmazonQDeveloperService.UpdateAssignment",
     }
 
     for attempt in range(max_retries + 1):
@@ -274,6 +330,8 @@ Examples:
   %(prog)s --report report.json --tier pro+ --workers 10
   %(prog)s --unsubscribe --csv users.csv --region us-east-1
   %(prog)s --unsubscribe --report report.json --region us-east-1
+  %(prog)s --change-tier --tier power --csv users.csv --region us-east-1
+  %(prog)s --change-tier --csv users.csv --region us-east-1
 """,
     )
 
@@ -283,6 +341,7 @@ Examples:
 
     parser.add_argument("--tier", "-t", help=f"{tier_help}. Required with --report, optional default with --csv")
     parser.add_argument("--unsubscribe", action="store_true", help="Unsubscribe users instead of subscribing (ignores --tier)")
+    parser.add_argument("--change-tier", action="store_true", help="Change existing subscription tier (uses --tier or CSV KiroTier column)")
     parser.add_argument("--region", "-r", default="us-east-1", help="AWS region (default: us-east-1)")
     parser.add_argument("--profile", "-p", help="AWS CLI named profile")
     parser.add_argument("--workers", "-w", type=int, default=5, help="Number of parallel workers (default: 5)")
@@ -298,6 +357,9 @@ Examples:
 
     if args.report and not args.tier and not args.unsubscribe:
         parser.error("--tier is required when using --report (unless --unsubscribe)")
+
+    if args.change_tier and not args.tier and not args.csv:
+        parser.error("--change-tier requires --tier or a CSV with KiroTier column")
 
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
     credentials = session.get_credentials().get_frozen_credentials()
@@ -369,6 +431,96 @@ Examples:
         print("=" * 60)
         print(f"  Unsubscribed : {len(succeeded)}")
         print(f"  Failed       : {len(failed)}")
+        print("=" * 60)
+
+        if failed:
+            print("\nFailed users:")
+            for uname, err in failed:
+                print(f"  - {uname}: {err}")
+            sys.exit(1)
+
+        logging.info("Done.")
+        return
+
+    # ---- change-tier mode -------------------------------------------------
+    if args.change_tier:
+        # Load users with tier info (same as subscribe mode)
+        if args.report:
+            if not args.report.exists():
+                logging.error("Report file not found: %s", args.report)
+                sys.exit(1)
+            if not args.tier:
+                parser.error("--tier is required when using --report with --change-tier")
+            users = get_users_from_report(args.report, args.tier)
+        else:
+            if not args.csv.exists():
+                logging.error("CSV file not found: %s", args.csv)
+                sys.exit(1)
+            users = get_users_from_csv(args.csv, args.tier)
+
+        if not users:
+            logging.error("No valid users to change tier")
+            sys.exit(1)
+
+        # Resolve user_ids
+        needs_resolve = [u for u in users if "user_id" not in u]
+        if needs_resolve:
+            logging.info("Resolving %d username(s) to UserIds...", len(needs_resolve))
+            id_store = get_identity_store_id(session, args.region)
+            all_users = list_all_users(session, id_store, args.region)
+            resolved = []
+            for u in users:
+                if "user_id" in u:
+                    resolved.append(u)
+                    continue
+                uid = all_users.get(u["username"])
+                if uid:
+                    u["user_id"] = uid
+                    resolved.append(u)
+                else:
+                    logging.warning("User '%s' not found in Identity Center, skipping", u["username"])
+            users = resolved
+
+        if not users:
+            logging.error("No users to process after resolving UserIds")
+            sys.exit(1)
+
+        tier_summary = {}
+        for u in users:
+            tier_summary[u["tier_label"]] = tier_summary.get(u["tier_label"], 0) + 1
+        for label, count in tier_summary.items():
+            logging.info("  %s: %d user(s)", label, count)
+        logging.info(
+            "Will change tier for %d user(s) with %d worker(s)",
+            len(users), min(args.workers, len(users)),
+        )
+
+        succeeded: list[str] = []
+        failed: list[tuple[str, str]] = []
+
+        def _change(user: dict) -> tuple[str, bool, str]:
+            ok, err = update_assignment(
+                user["user_id"], user["subscription_type"], credentials, args.region,
+            )
+            return user["username"], ok, err
+
+        with ThreadPoolExecutor(max_workers=min(args.workers, len(users))) as pool:
+            futures = {pool.submit(_change, u): u["username"] for u in users}
+            for fut in as_completed(futures):
+                username, ok, err = fut.result()
+                if ok:
+                    logging.info("Changed tier: %s -> %s", username,
+                                 next(u["tier_label"] for u in users if u["username"] == username))
+                    succeeded.append(username)
+                else:
+                    logging.error("Failed for %s: %s", username, err)
+                    failed.append((username, err))
+
+        print("\n" + "=" * 60)
+        print("KIRO CHANGE TIER SUMMARY")
+        print("=" * 60)
+        print(f"  Changed : {len(succeeded)}")
+        print(f"  Failed  : {len(failed)}")
         print("=" * 60)
 
         if failed:
